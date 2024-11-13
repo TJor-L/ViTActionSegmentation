@@ -3,11 +3,6 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-import os
-import numpy as np
-import torch
-from torch.utils.data import Dataset
-
 class VideoActionSegmentationDataset(Dataset):
     def __init__(self, data_dir, label_dir, memflow_dir, video_files, window_size=30, training=True):
         self.data_dir = data_dir
@@ -17,6 +12,7 @@ class VideoActionSegmentationDataset(Dataset):
         self.window_size = window_size
         self.training = training
         self.features_list, self.labels_list = self._load_all_windows()
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     def _load_all_windows(self):
         features_list = []
@@ -46,9 +42,9 @@ class VideoActionSegmentationDataset(Dataset):
 
     def __getitem__(self, idx):
         features, memflow = self.features_list[idx]
-        features = torch.tensor(features, dtype=torch.float32)
-        memflow = torch.tensor(memflow, dtype=torch.float32)
-        labels = torch.tensor(self.labels_list[idx], dtype=torch.float32)
+        features = torch.tensor(features, dtype=torch.float32).to(self.device)
+        memflow = torch.tensor(memflow, dtype=torch.float32).to(self.device)
+        labels = torch.tensor(self.labels_list[idx], dtype=torch.float32).to(self.device)
         return features, memflow, labels
 
 

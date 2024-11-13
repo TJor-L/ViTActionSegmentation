@@ -8,15 +8,11 @@ from viT.model import VideoActionSegmentationModel
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import numpy as np
-import datetime
-import seaborn as sns
-from sklearn.metrics import confusion_matrix
-import matplotlib.patches as mpatches
 import json
 
 from viT.losses import TotalLossWithContinuity
-from script.weight import smooth_class_weights
-
+from utils.weight import smooth_class_weights
+from utils.visualization import visualize_predictions, evaluate_and_plot_confusion_matrix
 
 # Hyperparameters
 DATA_DIR = 'dataset/rgb'
@@ -30,13 +26,41 @@ D_INPUT = 1024
 D_MODEL = 512
 NHEAD = 8
 NUM_LAYERS = 4
-NUM_CLASSES = 17
-FocalLoss_alpha = 0.25
 USE_MEMFLOW = True
 MASK = True
+Weighted = True
+Smooth_lambda = 0
+lambda_continuity = 0
+verbose = True
+BINARY_CLASS = 0  # Set this to the class number for binary classification (i != 0)
+
+hyperparameters = {
+    'DATA_DIR': DATA_DIR,
+    'MEMFLOW_DIR': MEMFLOW_DIR,
+    'LABEL_DIR': LABEL_DIR,
+    'BATCH_SIZE': BATCH_SIZE,
+    'LEARNING_RATE': LEARNING_RATE,
+    'NUM_EPOCHS': NUM_EPOCHS,
+    'WINDOW_SIZE': WINDOW_SIZE,
+    'D_INPUT': D_INPUT,
+    'D_MODEL': D_MODEL,
+    'NHEAD': NHEAD,
+    'NUM_LAYERS': NUM_LAYERS,
+    'USE_MEMFLOW': USE_MEMFLOW,
+    'MASK': MASK,
+    'Weighted': Weighted,
+    'Smooth_lambda': Smooth_lambda,
+    'lambda_continuity': lambda_continuity,
+    'BINARY_CLASS': BINARY_CLASS
+}
+
+# Adjust NUM_CLASSES based on BINARY_CLASS
+if BINARY_CLASS == 0:
+    NUM_CLASSES = 17
+else:
+    NUM_CLASSES = 2
 
 # Prepare datasets and data loaders
-
 with open('dataset/data_info.json', 'r') as f:
     data_info = json.load(f)
 video_files = [f for f in os.listdir(DATA_DIR) if f.endswith('.npy')]
@@ -53,6 +77,7 @@ val_dataset = VideoActionSegmentationDataset(
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
+
 # Model, Loss, and Optimizer
 model = VideoActionSegmentationModel(d_input=D_INPUT, d_model=D_MODEL, nhead=NHEAD, num_layers=NUM_LAYERS,
                                      num_classes=NUM_CLASSES, window_size=WINDOW_SIZE, use_memflow=USE_MEMFLOW, mask=MASK)
@@ -60,28 +85,45 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 model = model.to(device)
 print(f'Using device: {device}')
 
+if Weighted:
+    if BINARY_CLASS != 0:
+        class_counts = np.zeros(2)
+        for _, _, labels in train_loader:
+            labels_class = torch.argmax(labels, dim=2)
+            labels_class = (labels_class == BINARY_CLASS).long().view(-1).cpu().numpy()
+            for label in labels_class:
+                class_counts[label] += 1
+    else:
+        class_counts = np.zeros(NUM_CLASSES)
+        for _, _, labels in train_loader:
+            labels_class = torch.argmax(labels, dim=2).view(-1).cpu().numpy()
+            for label in labels_class:
+                class_counts[label] += 1
 
-# Calculate class weights based on the number of samples per class
-class_counts = np.zeros(NUM_CLASSES)
-for _, _, labels in train_loader:
-    labels_class = torch.argmax(labels, dim=2).view(-1).cpu().numpy()
-    for label in labels_class:
-        class_counts[label] += 1
+    if Smooth_lambda == 0:
+        class_weights = 1.0 / (class_counts + 1e-6)
+        class_weights = class_weights / \
+            np.sum(class_weights) * NUM_CLASSES
+        class_weights = torch.tensor(class_weights, dtype=torch.float, device=device)
+    else:
+        class_weights = smooth_class_weights(
+            class_counts=class_counts, smoothing_factor=Smooth_lambda, device=device, verbose=verbose)
+        
+    if BINARY_CLASS != 0:
+        class_weights = class_weights ** 2
+    if verbose:
+        print(class_counts)
+        print(class_weights)
+else:
+    class_weights = None
 
-# class_weights = 1.0 / (class_counts + 1e-6)  # Avoid division by zero
-# class_weights = class_weights / \
-#     np.sum(class_weights) * NUM_CLASSES  # Normalize weights
-# class_weights = torch.tensor(class_weights, dtype=torch.float, device=device)
 
-class_weights = smooth_class_weights(
-    class_counts=class_counts, smoothing_factor=50, device=device)
 
-# weights = [1.235, 1.492, 1.493, 2.326, 2.418, 2.272, 1.961, 1.538, 2.439, 2.070, 2.081, 1.163, 2.027, 1.190, 2.000, 1.694, 2.500]
-# class_weights = torch.tensor(weights, dtype=torch.float, device=device)
-print(class_weights)
-criterion = nn.CrossEntropyLoss(weight=class_weights)
-# criterion = TotalLossWithContinuity(
-#     lambda_continuity=0.5, num_classes=NUM_CLASSES, class_weights=class_weights) uncomment this if want to use Con loss
+if lambda_continuity == 0:
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+else:
+    criterion = TotalLossWithContinuity(
+        lambda_continuity=lambda_continuity, num_classes=NUM_CLASSES, class_weights=class_weights)
 
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
@@ -92,9 +134,12 @@ output_dir = 'output'
 os.makedirs(output_dir, exist_ok=True)
 
 # Create a unique folder for the entire training run based on hyperparameters
-hyperparams_str = f"bs{BATCH_SIZE}_lr{LEARNING_RATE}_ws{WINDOW_SIZE}_dmodel{D_MODEL}_layers{NUM_LAYERS}_MASK{MASK}_Train_Reverse_LOG_50_Weight_CEL_Aug"
+hyperparams_str = f"ws{WINDOW_SIZE}_dmodel{D_MODEL}_layers{NUM_LAYERS}_MASK{MASK}_Weighted_{Weighted}_SmoothLambda_{Smooth_lambda}_LambdaCont_{lambda_continuity}_Aug_BINARY_CLASS_{BINARY_CLASS}"
 run_output_dir = os.path.join(output_dir, hyperparams_str)
 os.makedirs(run_output_dir, exist_ok=True)
+
+with open(os.path.join(run_output_dir, 'hyperparams.json'), 'w') as f:
+    json.dump(hyperparameters, f, indent=4)
 
 for epoch in range(NUM_EPOCHS):
     model.train()
@@ -106,14 +151,18 @@ for epoch in range(NUM_EPOCHS):
             features, memflow, labels = features.to(
                 device), memflow.to(device), labels.to(device)
             labels_class = torch.argmax(labels, dim=2)
+            if BINARY_CLASS != 0:
+                labels_class = (labels_class == BINARY_CLASS).long()
 
             # Forward pass
             outputs = model(features, memflow=memflow)
 
-            # outputs(64, 15, 17), labels_class(64, 15)
-            # loss = criterion(outputs, labels_class) uncomment this if want to use conloss
-            loss = criterion(outputs.view(-1, NUM_CLASSES),
-                             labels_class.view(-1))
+            # outputs(64, 15, NUM_CLASSES), labels_class(64, 15)
+            if lambda_continuity == 0:
+                loss = criterion(outputs.view(-1, NUM_CLASSES),
+                                 labels_class.view(-1))
+            else:
+                loss = criterion(outputs, labels_class)
 
             optimizer.zero_grad()
             loss.backward()
@@ -121,8 +170,11 @@ for epoch in range(NUM_EPOCHS):
 
             running_loss += loss.item()
             predictions = torch.argmax(outputs, dim=2)
+            if BINARY_CLASS != 0:
+                predictions = (predictions == 1).long()
             correct_predictions += (predictions == labels_class).sum().item()
             total_predictions += labels_class.numel()
+            pbar.update(1)
 
     train_accuracy = correct_predictions / total_predictions
     print(f'Epoch {epoch + 1}, Loss: {running_loss / len(train_loader):.4f}, Train Accuracy: {train_accuracy:.4f}')
@@ -137,14 +189,21 @@ for epoch in range(NUM_EPOCHS):
             features, memflow, labels = features.to(
                 device), memflow.to(device), labels.to(device)
             labels_class = torch.argmax(labels, dim=2)
+            if BINARY_CLASS != 0:
+                labels_class = (labels_class == BINARY_CLASS).long()
 
             outputs = model(features, memflow=memflow)
 
-            # loss = criterion(outputs, labels_class) uncomment this if want to use conloss
-            loss = criterion(outputs.view(-1, NUM_CLASSES),
-                             labels_class.view(-1))
+            if lambda_continuity == 0:
+                loss = criterion(outputs.view(-1, NUM_CLASSES),
+                                 labels_class.view(-1))
+            else:
+                loss = criterion(outputs, labels_class)
+
             val_loss += loss.item()
             predictions = torch.argmax(outputs, dim=2)
+            if BINARY_CLASS != 0:
+                predictions = (predictions == 1).long()
             correct_predictions += (predictions == labels_class).sum().item()
             total_predictions += labels_class.numel()
 
@@ -156,96 +215,11 @@ for epoch in range(NUM_EPOCHS):
             run_output_dir, 'best_model.pth'))
     print(f'Epoch {epoch + 1}, Validation Loss: {val_loss / len(val_loader):.4f}, Validation Accuracy: {val_accuracy:.4f}')
     print(torch.cuda.memory_allocated(device='cuda') /
-          (1024 ** 2), "MB")  # Output GPU memory usage
+          (1024 ** 2), "MB")
 
-# Load best model
 model.load_state_dict(best_model_state)
 
-# Evaluate best model and generate confusion matrix
-
-
-def evaluate_and_plot_confusion_matrix(model, val_loader, output_dir):
-    model.eval()
-    all_preds = []
-    all_labels = []
-    with torch.no_grad():
-        for features, memflow, labels in val_loader:
-            features, memflow, labels = features.to(
-                device), memflow.to(device), labels.to(device)
-            labels_class = torch.argmax(labels, dim=2)
-
-            outputs = model(features, memflow=memflow)
-
-            predictions = torch.argmax(outputs, dim=2)
-            all_preds.extend(predictions.view(-1).cpu().numpy())
-            all_labels.extend(labels_class.view(-1).cpu().numpy())
-
-    cm = confusion_matrix(all_labels, all_preds, labels=list(
-        range(NUM_CLASSES)), normalize='true')
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(cm, annot=True, fmt='.2f', cmap='Blues', xticklabels=list(
-        range(NUM_CLASSES)), yticklabels=list(range(NUM_CLASSES)))
-    plt.xlabel('Predicted')
-    plt.ylabel('True')
-    plt.title('Normalized Confusion Matrix')
-
-    plt.savefig(os.path.join(output_dir, 'confusion_matrix.png'))
-    plt.show()
-
-
-evaluate_and_plot_confusion_matrix(model, val_loader, run_output_dir)
-
-# Visualization moved to separate code
-
-
-def visualize_predictions(model, features_path, memflow_path, label_path, output_dir):
-    model.eval()
-    features = np.load(features_path)
-    memflow = np.load(memflow_path)
-    labels = np.load(label_path)
-
-    features_tensor = torch.tensor(features, dtype=torch.float32).to(device)
-    memflow_tensor = torch.tensor(memflow, dtype=torch.float32).to(device)
-
-    predictions = []
-    with torch.no_grad():
-        for i in range(0, features.shape[0] - WINDOW_SIZE + 1, WINDOW_SIZE):
-            window_features = features_tensor[i:i + WINDOW_SIZE].unsqueeze(0)
-            window_memflow = memflow_tensor[i:i + WINDOW_SIZE].unsqueeze(0)
-
-            outputs = model(window_features, window_memflow)
-
-            window_predictions = torch.argmax(
-                outputs, dim=2).cpu().numpy().flatten()
-            predictions.extend(window_predictions)
-
-    true_colors = labels.argmax(axis=1)
-
-    # Set figure size to half height
-    plt.figure(figsize=(12, 6))  # Reduced height from 12 to 6
-    plt.subplot(2, 1, 1)
-    plt.imshow([predictions], aspect='auto',
-               cmap='tab20', interpolation='nearest')
-    plt.title('Predicted Classes')
-    plt.yticks([])
-
-    plt.subplot(2, 1, 2)
-    plt.imshow([true_colors], aspect='auto',
-               cmap='tab20', interpolation='nearest')
-    plt.title('Ground Truth Classes')
-    plt.yticks([])
-
-    # Create a legend for class colors, horizontally arranged at the bottom
-    class_patches = [mpatches.Patch(color=plt.cm.tab20(
-        i / NUM_CLASSES), label=f'Class {i}') for i in range(NUM_CLASSES)]
-    plt.legend(handles=class_patches, loc='lower center', bbox_to_anchor=(0.5, -0.5),
-               ncol=NUM_CLASSES // 2, frameon=False)  # Adjusted bbox_to_anchor for lower positioning
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(
-        output_dir, 'predictions_vs_ground_truth.png'), bbox_inches='tight')
-    plt.show()
-
+evaluate_and_plot_confusion_matrix(model, val_loader, run_output_dir, NUM_CLASSES=NUM_CLASSES, device=device)
 
 visualize_predictions(model, os.path.join(DATA_DIR, 'SK047.npy'), os.path.join(
-    MEMFLOW_DIR, 'SK047.npy'), os.path.join(LABEL_DIR, 'SK047.npy'), run_output_dir)
+    MEMFLOW_DIR, 'SK047.npy'), os.path.join(LABEL_DIR, 'SK047.npy'), run_output_dir, device=device, WINDOW_SIZE=WINDOW_SIZE, NUM_CLASSES=NUM_CLASSES)
